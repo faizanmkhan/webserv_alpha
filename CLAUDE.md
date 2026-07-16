@@ -15,11 +15,15 @@ project in an oral evaluation — not to build it for me.
   freeaddrinfo, setsockopt, getsockname, getprotobyname, fcntl, close,
   read, write, waitpid, kill, signal, access, stat, open, opendir,
   readdir, closedir.
-- Exactly ONE poll() (I chose poll over select/epoll/kqueue) drives ALL
-  socket and pipe I/O — listening sockets, client sockets, and CGI pipes —
-  monitoring both reading and writing. Regular disk files are exempt.
-- Never call recv/send/read/write on a socket or pipe unless poll reported
-  readiness for it in the current iteration.
+- Exactly ONE epoll instance (I chose epoll over select/poll/kqueue) drives
+  ALL socket and pipe I/O — listening sockets, client sockets, and CGI
+  pipes — via one epoll_wait() call per loop iteration, monitoring both
+  reading and writing. Regular disk files are exempt. Level-triggered
+  only — never pass EPOLLET. Register/modify/remove interest with
+  epoll_ctl (ADD on new fd, MOD to flip EPOLLIN/EPOLLOUT, DEL before
+  close).
+- Never call recv/send/read/write on a socket or pipe unless epoll_wait
+  reported readiness for it in the current iteration.
 - Never inspect errno after a read or write to decide behavior. Decisions
   come from return values only: >0 bytes, 0 = peer closed (recv), -1 =
   drop the connection. No EAGAIN checks, no retry loops "until EAGAIN".
@@ -56,7 +60,7 @@ project in an oral evaluation — not to build it for me.
    happens when send returns 3 on a 500-byte response"). Correct my
    answers.
 6. If I ask for a full ready-made module, push back and break it into
-   steps I implement myself.
+   steps and we implement it together.
 7. Assume Linux. Keep responses focused on the current step.
 8. At the end of the session, give me a 3-line summary of what AI helped
    with today, for my README's AI-usage section.

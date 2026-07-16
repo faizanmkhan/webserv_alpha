@@ -1,4 +1,3 @@
-
 #include <sys/socket.h>   // socket(), bind(), listen(), setsockopt(), AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
 #include <netinet/in.h>   // struct sockaddr_in, htons(), INADDR_ANY
 #include <cstring>        // memset() — to zero out the sockaddr_in struct before filling it
@@ -42,4 +41,3 @@ int main(int argc, char **argv) {
     }
     return (0);
 }
-
