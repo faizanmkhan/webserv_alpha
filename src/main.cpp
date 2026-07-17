@@ -1,45 +1,67 @@
+#include "config/Lexer.hpp"
+#include "config/ConfigParser.hpp"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 
-#include <sys/socket.h>   // socket(), bind(), listen(), setsockopt(), AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR
-#include <netinet/in.h>   // struct sockaddr_in, htons(), INADDR_ANY
-#include <cstring>        // memset() — to zero out the sockaddr_in struct before filling it
-#include <unistd.h>       // close() — you'll need it soon, for when a call fails or at shutdown
-
-int main(int argc, char **argv) {
-
-    (void)argc;
-    (void)argv;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(fd == -1)
-    {
-        return (1);
-    }
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // check retun value
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(8080);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1)
-    {
-        return(1);
-    }
-    listen(fd, 16); // check return value
-    while (1)
-    {
-        char buf[1024];
-        int client_fd = accept(fd, NULL, NULL);
-        if( client_fd == -1)
-            continue;
-        int n = recv(client_fd, buf, sizeof(buf), 0);
-        if (n > 0)
-        {
-            write(1, buf, n);
-        }
-        char response[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello, world!";
-        send(client_fd, response, sizeof(response) -1, 0);
-        close(client_fd);
-    }
-    return (0);
+static void printLocation(const LocationConfig &loc)
+{
+    std::cout << "  location " << loc.path << " {" << std::endl;
+    std::cout << "    methods:";
+    for (size_t i = 0; i < loc.methods.size(); ++i)
+        std::cout << " " << loc.methods[i];
+    std::cout << std::endl;
+    std::cout << "    root: " << loc.root << std::endl;
+    std::cout << "    index: " << loc.index << std::endl;
+    std::cout << "    autoindex: " << (loc.autoindex ? "on" : "off") << std::endl;
+    std::cout << "    upload_store: " << loc.upload_store << std::endl;
+    for (std::map<std::string, std::string>::const_iterator it = loc.cgi_ext.begin(); it != loc.cgi_ext.end(); ++it)
+        std::cout << "    cgi_ext: " << it->first << " -> " << it->second << std::endl;
+    if (loc.has_redirect)
+        std::cout << "    redirect: " << loc.redirect_code << " " << loc.redirect_target << std::endl;
+    std::cout << "  }" << std::endl;
 }
 
+static void printServer(const ServerConfig &srv)
+{
+    std::cout << "server {" << std::endl;
+    std::cout << "  listen: " << srv.host << ":" << srv.port << std::endl;
+    std::cout << "  server_name: " << srv.server_name << std::endl;
+    std::cout << "  client_max_body_size: " << srv.client_max_body_size << std::endl;
+    for (std::map<int, std::string>::const_iterator it = srv.error_pages.begin(); it != srv.error_pages.end(); ++it)
+        std::cout << "  error_page: " << it->first << " -> " << it->second << std::endl;
+    for (size_t i = 0; i < srv.locations.size(); ++i)
+        printLocation(srv.locations[i]);
+    std::cout << "}" << std::endl;
+}
+
+int main(int argc, char **argv)
+{
+    std::string path = (argc > 1) ? argv[1] : "config/default.conf";
+    std::ifstream file(path.c_str());
+    if (!file)
+    {
+        std::cerr << "webserv: cannot open config file: " << path << std::endl;
+        return 1;
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+
+    std::vector<Token> tokens = tokenize(content);
+
+    try
+    {
+        ConfigParser parser(tokens);
+        std::vector<ServerConfig> servers = parser.parse();
+        for (size_t i = 0; i < servers.size(); ++i)
+            printServer(servers[i]);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "webserv: " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
