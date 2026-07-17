@@ -80,8 +80,6 @@ LocationConfig ConfigParser::parseLocation()
     return loc;
 }
 
-// --- everything below this line is yours to write ---
-
 void ConfigParser::parseServerDirective(ServerConfig &srv)
 {
     if (checkWord("listen"))
@@ -210,4 +208,3 @@ void ConfigParser::parseLocationDirective(LocationConfig &loc)
     else
         throw std::runtime_error("unknown directive: " + current().value);
 }
-

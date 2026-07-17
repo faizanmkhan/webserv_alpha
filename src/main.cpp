@@ -1,5 +1,6 @@
 #include "config/Lexer.hpp"
 #include "config/ConfigParser.hpp"
+#include "server/EventLoop.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -57,6 +58,7 @@ int main(int argc, char **argv)
         std::vector<ServerConfig> servers = parser.parse();
         for (size_t i = 0; i < servers.size(); ++i)
             printServer(servers[i]);
+        runEventLoop(servers);
     }
     catch (const std::exception &e)
     {
