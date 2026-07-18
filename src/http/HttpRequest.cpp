@@ -94,3 +94,52 @@ bool parseRequest(const std::string &raw, HttpRequest &out)
     }
     return true;
 }
+
+// Parse a chunk-size line (hexadecimal, possibly with a ";ext"). Returns false
+// on an empty or non-hex size.
+static bool parseChunkSize(const std::string &line, unsigned long &val)
+{
+    std::string s = line;
+    size_t semi = s.find(';');          // strip any chunk extension
+    if (semi != std::string::npos)
+        s = s.substr(0, semi);
+    if (s.empty())
+        return false;
+    val = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (!isHexDigit(s[i]))
+            return false;
+        val = val * 16 + hexValue(s[i]);
+    }
+    return true;
+}
+
+ChunkStatus decodeChunked(const std::string &raw, std::string &out)
+{
+    out.clear();
+    size_t i = 0;
+    while (true)
+    {
+        size_t lineEnd = raw.find("\r\n", i);
+        if (lineEnd == std::string::npos)
+            return CHUNK_INCOMPLETE;                 // size line not fully here
+
+        unsigned long chunkSize;
+        if (!parseChunkSize(raw.substr(i, lineEnd - i), chunkSize))
+            return CHUNK_ERROR;                      // malformed size
+
+        size_t dataStart = lineEnd + 2;
+        if (chunkSize == 0)                          // final chunk
+        {
+            if (raw.size() < dataStart + 2)          // need terminating CRLF
+                return CHUNK_INCOMPLETE;
+            return CHUNK_DONE;
+        }
+        if (raw.size() < dataStart + chunkSize + 2)  // data + its CRLF not all here
+            return CHUNK_INCOMPLETE;
+
+        out.append(raw, dataStart, chunkSize);
+        i = dataStart + chunkSize + 2;               // skip data + CRLF
+    }
+}

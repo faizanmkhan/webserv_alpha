@@ -16,4 +16,10 @@ struct HttpRequest
 
 bool parseRequest(const std::string &raw, HttpRequest &out);
 
+// Decode a Transfer-Encoding: chunked body. `raw` is the bytes after the header
+// block. On CHUNK_DONE `out` holds the un-chunked body. CHUNK_INCOMPLETE means
+// wait for more bytes; CHUNK_ERROR means malformed (answer 400).
+enum ChunkStatus { CHUNK_INCOMPLETE, CHUNK_DONE, CHUNK_ERROR };
+ChunkStatus decodeChunked(const std::string &raw, std::string &out);
+
 #endif

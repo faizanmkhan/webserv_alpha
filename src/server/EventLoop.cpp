@@ -1,5 +1,12 @@
 #include "EventLoop.hpp"
+#include "../http/CgiHandler.hpp"
 #include <sstream>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <ctime>
+#include <csignal>
+
+#define CGI_TIMEOUT 5   // seconds a CGI child may run before we kill it -> 504
 
 // Flip a client fd from "I want to read" to "I want to write". We call this
 // once a full response has been built into writeBuffer, so the next time the
@@ -11,6 +18,129 @@ static void flipToWrite(int epfd, int fd)
     ev.events  = EPOLLOUT;
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+static void epollAdd(int epfd, int fd, unsigned int events)
+{
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+static void epollMod(int epfd, int fd, unsigned int events)
+{
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+// One of a CGI child's pipes is ready. `fd` is the pipe; pipeOwner tells us
+// which client it belongs to. We either feed the child more body (inFd) or
+// read its output (outFd); on EOF we reap and build the client's response.
+static void handleCgiEvent(int epfd, int fd, unsigned int revents,
+                           std::map<int, ClientConnection> &clients,
+                           std::map<int, int> &pipeOwner)
+{
+    int clientFd = pipeOwner[fd];
+    std::map<int, ClientConnection>::iterator cit = clients.find(clientFd);
+    if (cit == clients.end())
+        return;
+    ClientConnection &c = cit->second;
+
+    // ---- writing the request body into the child's stdin ----
+    if (fd == c.cgiInFd && (revents & (EPOLLOUT | EPOLLHUP | EPOLLERR)))
+    {
+        int w = write(fd, c.cgiInBuf.c_str() + c.cgiInOff,
+                          c.cgiInBuf.size() - c.cgiInOff);
+        if (w > 0)
+            c.cgiInOff += static_cast<size_t>(w);
+        if (w <= 0 || c.cgiInOff >= c.cgiInBuf.size())
+        {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            close(fd);                 // EOF to the child: "body is complete"
+            pipeOwner.erase(fd);
+            c.cgiInFd = -1;
+        }
+        return;
+    }
+
+    // ---- reading the child's stdout ----
+    if (fd == c.cgiOutFd && (revents & (EPOLLIN | EPOLLHUP | EPOLLERR)))
+    {
+        char buf[BUF_SIZE];
+        int r = read(fd, buf, sizeof(buf));
+        if (r > 0)
+        {
+            c.cgiOutBuf.append(buf, static_cast<size_t>(r));
+            return;                    // more may come; stay registered
+        }
+
+        // r == 0 (EOF) or r == -1: the script is done producing output.
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        close(fd);
+        pipeOwner.erase(fd);
+        c.cgiOutFd = -1;
+
+        if (c.cgiInFd != -1)           // child died before we finished the body
+        {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, c.cgiInFd, NULL);
+            close(c.cgiInFd);
+            pipeOwner.erase(c.cgiInFd);
+            c.cgiInFd = -1;
+        }
+
+        int status;
+        waitpid(c.cgiPid, &status, 0);  // EOF means it has closed stdout → about to exit
+        c.cgiPid = -1;
+
+        c.writeBuffer = buildCgiResponse(c.cgiOutBuf);
+        c.state = WRITING;
+        flipToWrite(epfd, clientFd);    // hand off to your existing send path
+    }
+}
+
+// Called once per loop iteration: any CGI child running longer than
+// CGI_TIMEOUT is killed and its client answered with 504. This is our
+// "requests never hang" guarantee for CGI.
+static void reapTimedOutCgi(int epfd, std::map<int, ClientConnection> &clients,
+                            std::map<int, int> &pipeOwner)
+{
+    time_t now = time(NULL);
+    for (std::map<int, ClientConnection>::iterator it = clients.begin();
+         it != clients.end(); ++it)
+    {
+        ClientConnection &c = it->second;
+        if (c.state != CGI_RUNNING || now - c.cgiStart < CGI_TIMEOUT)
+            continue;
+
+        if (c.cgiPid > 0)
+        {
+            kill(c.cgiPid, SIGKILL);        // force the stuck script to die
+            waitpid(c.cgiPid, NULL, 0);     // reap it (SIGKILL => it exits promptly)
+            c.cgiPid = -1;
+        }
+        if (c.cgiInFd != -1)
+        {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, c.cgiInFd, NULL);
+            close(c.cgiInFd);
+            pipeOwner.erase(c.cgiInFd);
+            c.cgiInFd = -1;
+        }
+        if (c.cgiOutFd != -1)
+        {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, c.cgiOutFd, NULL);
+            close(c.cgiOutFd);
+            pipeOwner.erase(c.cgiOutFd);
+            c.cgiOutFd = -1;
+        }
+        c.writeBuffer = errorResponse(504, "Gateway Timeout");
+        c.state = WRITING;
+        flipToWrite(epfd, it->first);
+    }
 }
 
 void runEventLoop(const std::vector<ServerConfig> &servers)
@@ -39,11 +169,12 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
     }
 
     std::map<int, ClientConnection> clients;
+    std::map<int, int> pipeOwner;   // pipe fd -> owning client fd
     struct epoll_event events[MAX_EVENTS];
 
     while (true)
     {
-        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        int n = epoll_wait(epfd, events, MAX_EVENTS, 1000);
         if (n == -1)
             throw std::runtime_error(std::string("epoll_wait: ") + strerror(errno));
 
@@ -73,6 +204,10 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                     continue;
                 }
                 clients[clientFd].serverIndex = lit->second;
+            }
+            else if (pipeOwner.find(fd) != pipeOwner.end())
+            {
+                handleCgiEvent(epfd, fd, events[i].events, clients, pipeOwner);
             }
             else
             {
@@ -110,33 +245,110 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         continue;
                     }
 
-                    // ---- Stage 2: how long is the body, and is it all here? ----
+                    // ---- Stage 2: get the full body (chunked or Content-Length) ----
                     size_t headerEnd = pos + 4;   // first byte of the body
-                    size_t contentLength = 0;
-                    std::map<std::string, std::string>::const_iterator cl =
-                        req.headers.find("content-length");
-                    if (cl != req.headers.end())
+
+                    bool chunked = false;
+                    std::map<std::string, std::string>::const_iterator te =
+                        req.headers.find("transfer-encoding");
+                    if (te != req.headers.end() &&
+                        te->second.find("chunked") != std::string::npos)
+                        chunked = true;
+
+                    if (chunked)
                     {
-                        std::istringstream iss(cl->second);
-                        iss >> contentLength;     // TODO: reject non-numeric with 400
+                        // Un-chunk before anyone (CGI included) sees the body.
+                        std::string decoded;
+                        ChunkStatus cs =
+                            decodeChunked(cit->second.buffer.substr(headerEnd), decoded);
+                        if (cs == CHUNK_INCOMPLETE)
+                            continue;                 // wait for more bytes
+                        if (cs == CHUNK_ERROR)
+                        {
+                            cit->second.writeBuffer = errorResponse(400, "Bad Request");
+                            flipToWrite(epfd, fd);
+                            continue;
+                        }
+                        if (decoded.size() > srv.client_max_body_size)
+                        {
+                            cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
+                            flipToWrite(epfd, fd);
+                            continue;
+                        }
+                        req.body = decoded;
+                    }
+                    else
+                    {
+                        size_t contentLength = 0;
+                        std::map<std::string, std::string>::const_iterator cl =
+                            req.headers.find("content-length");
+                        if (cl != req.headers.end())
+                        {
+                            std::istringstream iss(cl->second);
+                            iss >> contentLength;     // TODO: reject non-numeric with 400
+                        }
+
+                        // Refuse an oversized body up front, before waiting for it.
+                        if (contentLength > srv.client_max_body_size)
+                        {
+                            cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
+                            flipToWrite(epfd, fd);
+                            continue;
+                        }
+
+                        // Body not fully arrived yet: keep reading on next EPOLLIN.
+                        if (cit->second.buffer.size() < headerEnd + contentLength)
+                            continue;
+
+                        // TODO(phase10): with keep-alive, erase the consumed request
+                        // from buffer instead of relying on Connection: close.
+                        req.body = cit->second.buffer.substr(headerEnd, contentLength);
                     }
 
-                    // Refuse an oversized body up front, before waiting for it.
-                    if (contentLength > srv.client_max_body_size)
+                    std::string interp, script;
+                    if (resolveCgi(srv, req, interp, script))
                     {
-                        cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
-                        flipToWrite(epfd, fd);
+                        struct stat st;
+                        if (stat(script.c_str(), &st) == -1 || S_ISDIR(st.st_mode))
+                        {
+                            cit->second.writeBuffer = errorResponse(404, "Not Found");
+                            flipToWrite(epfd, fd);
+                            continue;
+                        }
+                        CgiProcess proc;
+                        if (!startCgi(srv, req, interp, script, proc))
+                        {
+                            cit->second.writeBuffer = errorResponse(500, "Internal Server Error");
+                            flipToWrite(epfd, fd);
+                            continue;
+                        }
+
+                        cit->second.state    = CGI_RUNNING;
+                        cit->second.cgiPid   = proc.pid;
+                        cit->second.cgiOutFd = proc.outFd;
+                        cit->second.cgiStart = time(NULL);
+                        cit->second.cgiOutBuf.clear();
+
+                        epollMod(epfd, fd, 0);                  // client goes idle
+                        epollAdd(epfd, proc.outFd, EPOLLIN);    // watch script output
+                        pipeOwner[proc.outFd] = fd;
+
+                        if (!req.body.empty())
+                        {
+                            cit->second.cgiInFd  = proc.inFd;
+                            cit->second.cgiInBuf = req.body;
+                            cit->second.cgiInOff = 0;
+                            epollAdd(epfd, proc.inFd, EPOLLOUT); // feed the body
+                            pipeOwner[proc.inFd] = fd;
+                        }
+                        else
+                        {
+                            close(proc.inFd);                    // no body -> EOF now
+                            cit->second.cgiInFd = -1;
+                        }
                         continue;
                     }
 
-                    // Body not fully arrived yet: keep reading on the next EPOLLIN.
-                    if (cit->second.buffer.size() < headerEnd + contentLength)
-                        continue;
-
-                    // Full request in hand: slice out the body and dispatch.
-                    // TODO(phase10): with keep-alive we must erase the consumed
-                    // request from buffer instead of relying on Connection: close.
-                    req.body = cit->second.buffer.substr(headerEnd, contentLength);
                     cit->second.writeBuffer = handleRequest(srv, req);
                     flipToWrite(epfd, fd);
                 }
@@ -158,5 +370,7 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                 }
             }
         }
+
+        reapTimedOutCgi(epfd, clients, pipeOwner);
     }
 }
