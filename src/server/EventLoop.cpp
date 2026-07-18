@@ -1,4 +1,17 @@
 #include "EventLoop.hpp"
+#include <sstream>
+
+// Flip a client fd from "I want to read" to "I want to write". We call this
+// once a full response has been built into writeBuffer, so the next time the
+// socket is writable epoll wakes us on EPOLLOUT and we send it.
+static void flipToWrite(int epfd, int fd)
+{
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events  = EPOLLOUT;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
 
 void runEventLoop(const std::vector<ServerConfig> &servers)
 {
@@ -81,25 +94,51 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                     }
                     cit->second.buffer.append(buf, r);
 
+                    // ---- Stage 1: do we have the whole header block yet? ----
                     size_t pos = cit->second.buffer.find("\r\n\r\n");
-                    if (pos != std::string::npos)
-                    {
-                        // Full header block received: build the response now,
-                        // then flip this fd to writing and send it on EPOLLOUT.
-                        HttpRequest req;
-                        const ServerConfig &srv = servers[cit->second.serverIndex];
-                        if (parseRequest(cit->second.buffer.substr(0, pos + 2), req))
-                            cit->second.writeBuffer = handleRequest(srv, req);
-                        else
-                            cit->second.writeBuffer = errorResponse(400, "Bad Request");
+                    if (pos == std::string::npos)
+                        continue;   // headers incomplete, wait for next EPOLLIN
 
-                        struct epoll_event wev;
-                        std::memset(&wev, 0, sizeof(wev));
-                        wev.events = EPOLLOUT;
-                        wev.data.fd = fd;
-                        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &wev);
+                    const ServerConfig &srv = servers[cit->second.serverIndex];
+
+                    // Parse the header block so we can read Content-Length.
+                    HttpRequest req;
+                    if (!parseRequest(cit->second.buffer.substr(0, pos + 2), req))
+                    {
+                        cit->second.writeBuffer = errorResponse(400, "Bad Request");
+                        flipToWrite(epfd, fd);
+                        continue;
                     }
-                    // else: headers incomplete, keep reading on the next EPOLLIN
+
+                    // ---- Stage 2: how long is the body, and is it all here? ----
+                    size_t headerEnd = pos + 4;   // first byte of the body
+                    size_t contentLength = 0;
+                    std::map<std::string, std::string>::const_iterator cl =
+                        req.headers.find("content-length");
+                    if (cl != req.headers.end())
+                    {
+                        std::istringstream iss(cl->second);
+                        iss >> contentLength;     // TODO: reject non-numeric with 400
+                    }
+
+                    // Refuse an oversized body up front, before waiting for it.
+                    if (contentLength > srv.client_max_body_size)
+                    {
+                        cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
+                        flipToWrite(epfd, fd);
+                        continue;
+                    }
+
+                    // Body not fully arrived yet: keep reading on the next EPOLLIN.
+                    if (cit->second.buffer.size() < headerEnd + contentLength)
+                        continue;
+
+                    // Full request in hand: slice out the body and dispatch.
+                    // TODO(phase10): with keep-alive we must erase the consumed
+                    // request from buffer instead of relying on Connection: close.
+                    req.body = cit->second.buffer.substr(headerEnd, contentLength);
+                    cit->second.writeBuffer = handleRequest(srv, req);
+                    flipToWrite(epfd, fd);
                 }
                 else if (events[i].events & EPOLLOUT)
                 {

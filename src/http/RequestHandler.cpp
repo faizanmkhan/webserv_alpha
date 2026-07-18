@@ -1,10 +1,5 @@
 #include "RequestHandler.hpp"
 #include "Router.hpp"
-#include <sstream>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <dirent.h>
 
 static std::string buildResponse(int code, const std::string &reason,
                                  const std::string &contentType,
@@ -24,6 +19,24 @@ std::string errorResponse(int code, const std::string &reason)
     std::ostringstream body;
     body << "<html><body><h1>" << code << " " << reason << "</h1></body></html>";
     return buildResponse(code, reason, "text/html", body.str());
+}
+
+static std::string noContentResponse()
+{
+    return "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+}
+
+static std::string createdResponse(const std::string &location)
+{
+    std::string body = "<html><body><h1>201 Created</h1></body></html>";
+    std::ostringstream oss;
+    oss << "HTTP/1.1 201 Created\r\n";
+    oss << "Content-Type: text/html\r\n";
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Location: " << location << "\r\n";
+    oss << "Connection: close\r\n\r\n";
+    oss << body;
+    return oss.str();
 }
 
 static std::string redirectResponse(int code, const std::string &location)
@@ -98,6 +111,27 @@ static bool readFile(const std::string &path, std::string &out)
         out.append(buf, static_cast<size_t>(r));
     close(fd);
     return (r != -1);
+}
+// Write `data` to a regular file, creating/truncating it. Like readFile, a
+// regular file is exempt from the epoll rule, so a synchronous loop is fine.
+static bool writeFile(const std::string &path, const std::string &data)
+{
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1)
+        return false;
+    size_t total = 0;
+    while (total < data.size())
+    {
+        ssize_t w = write(fd, data.c_str() + total, data.size() - total);
+        if (w <= 0)                 // decision from return value only, no errno
+        {
+            close(fd);
+            return false;
+        }
+        total += static_cast<size_t>(w);
+    }
+    close(fd);
+    return true;
 }
 
 // Produce an error response, preferring a configured custom error_page file.
@@ -181,6 +215,120 @@ static std::string serveGet(const ServerConfig &srv, const LocationConfig &loc,
     return buildResponse(200, "OK", contentTypeFor(fsPath), body);
 }
 
+// Parse a multipart/form-data body: find the part carrying a file (the one
+// with a filename="..." attribute) and extract its original filename and its
+// raw bytes. Returns false if the body is malformed or carries no file part.
+//
+// A part looks like:
+//   --BOUNDARY\r\n
+//   Content-Disposition: form-data; name="file"; filename="photo.jpg"\r\n
+//   Content-Type: image/jpeg\r\n
+//   \r\n                      <- blank line: headers end here
+//   <raw file bytes>\r\n
+//   --BOUNDARY--\r\n
+static bool parseMultipart(const std::string &body, const std::string &boundary,
+                           std::string &filename, std::string &content)
+{
+    std::string delim = "--" + boundary;
+
+    // Locate the file part via its filename= attribute.
+    size_t fn = body.find("filename=\"");
+    if (fn == std::string::npos)
+        return false;
+    fn += 10;                                 // strlen of  filename="
+    size_t fnEnd = body.find('"', fn);
+    if (fnEnd == std::string::npos)
+        return false;
+    filename = body.substr(fn, fnEnd - fn);
+    if (filename.empty())
+        return false;                         // form submitted with no file chosen
+
+    // The file bytes start after this part's blank line (first \r\n\r\n after
+    // the filename), and end right before the next boundary (\r\n--BOUNDARY).
+    size_t start = body.find("\r\n\r\n", fnEnd);
+    if (start == std::string::npos)
+        return false;
+    start += 4;
+
+    size_t end = body.find("\r\n" + delim, start);
+    if (end == std::string::npos)
+        return false;
+
+    content = body.substr(start, end - start);
+    return true;
+}
+
+static std::string serveDelete(const ServerConfig &srv, const LocationConfig &loc,
+                               const HttpRequest &req)
+{
+    std::string fsPath = loc.root + req.path;   // same mapping as GET
+
+    struct stat st;
+    if (stat(fsPath.c_str(), &st) == -1)
+        return errorPage(srv, &loc, 404, "Not Found");
+    if (S_ISDIR(st.st_mode))
+        return errorPage(srv, &loc, 403, "Forbidden");   // no deleting directories
+    if (access(fsPath.c_str(), W_OK) == -1)
+        return errorPage(srv, &loc, 403, "Forbidden");   // not writable
+
+    if (std::remove(fsPath.c_str()) != 0)
+        return errorPage(srv, &loc, 403, "Forbidden");   // removal denied/failed
+
+    return noContentResponse();                          // 204: gone
+}
+
+static std::string serveUpload(const ServerConfig &srv, const LocationConfig &loc,
+                               const HttpRequest &req)
+{
+    // Uploads disabled on this route (no upload_store configured).
+    if (loc.upload_store.empty())
+        return errorPage(srv, &loc, 403, "Forbidden");
+
+    std::string filename;
+    std::string content;
+
+    // Browser form upload (multipart) vs. raw body (curl --data-binary)?
+    std::map<std::string, std::string>::const_iterator ct =
+        req.headers.find("content-type");
+    if (ct != req.headers.end() &&
+        ct->second.find("multipart/form-data") != std::string::npos)
+    {
+        // Pull boundary=... out of the Content-Type value.
+        size_t b = ct->second.find("boundary=");
+        if (b == std::string::npos)
+            return errorPage(srv, &loc, 400, "Bad Request");
+        std::string boundary = ct->second.substr(b + 9);
+        size_t stop = boundary.find_first_of("; \t\r\n");   // trim any trailing params
+        if (stop != std::string::npos)
+            boundary = boundary.substr(0, stop);
+
+        if (!parseMultipart(req.body, boundary, filename, content))
+            return errorPage(srv, &loc, 400, "Bad Request");
+    }
+    else
+    {
+        // Raw upload: filename from the URL path, content is the whole body.
+        size_t slash = req.path.rfind('/');
+        filename = (slash == std::string::npos)
+                   ? req.path : req.path.substr(slash + 1);
+        content = req.body;
+    }
+
+    // The filename may come from the client (multipart) — keep only the
+    // basename so an uploaded name like "../../x" cannot escape upload_store.
+    size_t s2 = filename.rfind('/');
+    if (s2 != std::string::npos)
+        filename = filename.substr(s2 + 1);
+    if (filename.empty() || filename == "..")
+        return errorPage(srv, &loc, 400, "Bad Request");
+
+    std::string dest = loc.upload_store + "/" + filename;
+    if (!writeFile(dest, content))
+        return errorPage(srv, &loc, 500, "Internal Server Error");
+
+    return createdResponse(loc.path + "/" + filename);   // where to GET it back
+}
+
 std::string handleRequest(const ServerConfig &srv, const HttpRequest &req)
 {
     // Reject any path that tries to climb out of the configured root.
@@ -200,6 +348,11 @@ std::string handleRequest(const ServerConfig &srv, const HttpRequest &req)
     if (req.method == "GET")
         return serveGet(srv, *loc, req);
 
-    // POST and DELETE bodies are handled in a later phase.
+    if (req.method == "POST")
+        return serveUpload(srv, *loc, req);
+
+    if (req.method == "DELETE")
+        return serveDelete(srv, *loc, req);
+
     return errorPage(srv, loc, 501, "Not Implemented");
 }

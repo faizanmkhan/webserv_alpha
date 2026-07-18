@@ -4,6 +4,12 @@
 #include "../config/ConfigTypes.hpp"
 #include "HttpRequest.hpp"
 #include <string>
+#include <cstdio>
+#include <sstream>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
 
 // Build the full HTTP response (status line + headers + body) for a request.
 std::string handleRequest(const ServerConfig &srv, const HttpRequest &req);

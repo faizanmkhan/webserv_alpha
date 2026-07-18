@@ -11,6 +11,7 @@ struct HttpRequest
     std::string                        query;     // everything after '?', raw (for CGI QUERY_STRING)
     std::string                        version;   // "HTTP/1.1"
     std::map<std::string, std::string> headers;
+    std::string                        body;      // raw request body bytes
 };
 
 bool parseRequest(const std::string &raw, HttpRequest &out);

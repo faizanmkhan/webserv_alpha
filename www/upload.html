@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>webserv — upload</title>
+</head>
+<body>
+    <h1>Upload a file</h1>
+    <form action="/uploads" method="POST" enctype="multipart/form-data">
+        <input type="file" name="file">
+        <input type="submit" value="Upload">
+    </form>
+    <p><a href="/uploads/">Browse uploaded files</a></p>
+</body>
+</html>
