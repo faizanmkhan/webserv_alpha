@@ -19,10 +19,13 @@ struct HttpRequest
 // 505 (unsupported HTTP version).
 int parseRequest(const std::string &raw, HttpRequest &out);
 
-// Decode a Transfer-Encoding: chunked body. `raw` is the bytes after the header
-// block. On CHUNK_DONE `out` holds the un-chunked body. CHUNK_INCOMPLETE means
-// wait for more bytes; CHUNK_ERROR means malformed (answer 400).
+// Resumable decoder for a Transfer-Encoding: chunked body. `raw` is the whole
+// receive buffer; `pos` is where parsing left off (start it at the first body
+// byte) and is advanced past every completed chunk; decoded bytes are APPENDED
+// to `out`. Calling it again after more bytes arrive resumes from `pos`, so
+// each byte is parsed exactly once — never re-decoded from scratch.
+// CHUNK_INCOMPLETE means wait for more bytes; CHUNK_ERROR means malformed (400).
 enum ChunkStatus { CHUNK_INCOMPLETE, CHUNK_DONE, CHUNK_ERROR };
-ChunkStatus decodeChunked(const std::string &raw, std::string &out);
+ChunkStatus decodeChunked(const std::string &raw, size_t &pos, std::string &out);
 
 #endif

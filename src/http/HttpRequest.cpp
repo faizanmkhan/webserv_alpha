@@ -124,18 +124,16 @@ static bool parseChunkSize(const std::string &line, unsigned long &val)
     return true;
 }
 
-ChunkStatus decodeChunked(const std::string &raw, std::string &out)
+ChunkStatus decodeChunked(const std::string &raw, size_t &pos, std::string &out)
 {
-    out.clear();
-    size_t i = 0;
     while (true)
     {
-        size_t lineEnd = raw.find("\r\n", i);
+        size_t lineEnd = raw.find("\r\n", pos);
         if (lineEnd == std::string::npos)
             return CHUNK_INCOMPLETE;                 // size line not fully here
 
         unsigned long chunkSize;
-        if (!parseChunkSize(raw.substr(i, lineEnd - i), chunkSize))
+        if (!parseChunkSize(raw.substr(pos, lineEnd - pos), chunkSize))
             return CHUNK_ERROR;                      // malformed size
 
         size_t dataStart = lineEnd + 2;
@@ -143,12 +141,13 @@ ChunkStatus decodeChunked(const std::string &raw, std::string &out)
         {
             if (raw.size() < dataStart + 2)          // need terminating CRLF
                 return CHUNK_INCOMPLETE;
+            pos = dataStart + 2;
             return CHUNK_DONE;
         }
         if (raw.size() < dataStart + chunkSize + 2)  // data + its CRLF not all here
-            return CHUNK_INCOMPLETE;
+            return CHUNK_INCOMPLETE;                 // pos stays: retry this chunk
 
         out.append(raw, dataStart, chunkSize);
-        i = dataStart + chunkSize + 2;               // skip data + CRLF
+        pos = dataStart + chunkSize + 2;             // consumed: never look back
     }
 }

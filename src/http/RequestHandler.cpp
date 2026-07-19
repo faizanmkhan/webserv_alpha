@@ -205,7 +205,7 @@ static std::string serveGet(const ServerConfig &srv, const LocationConfig &loc,
         else if (loc.autoindex)
             return autoindexPage(fsPath, req.path); // no index -> directory listing
         else
-            return errorPage(srv, &loc, 403, "Forbidden");
+            return errorPage(srv, &loc, 404, "Not Found");  // nothing servable here
     }
 
     std::string body;
@@ -329,30 +329,49 @@ static std::string serveUpload(const ServerConfig &srv, const LocationConfig &lo
     return createdResponse(loc.path + "/" + filename);   // where to GET it back
 }
 
+// A HEAD response must carry the same status line and headers as the GET
+// would, but no body. We build the GET response and cut everything after the
+// blank line, leaving Content-Length reporting the size GET would have sent.
+static std::string stripBody(const std::string &resp)
+{
+    size_t hdrEnd = resp.find("\r\n\r\n");
+    if (hdrEnd == std::string::npos)
+        return resp;
+    return resp.substr(0, hdrEnd + 4);
+}
+
 std::string handleRequest(const ServerConfig &srv, const HttpRequest &req)
 {
+    bool isHead = (req.method == "HEAD");
+    std::string resp;
+
     // Reject any path that tries to climb out of the configured root.
     if (req.path.find("..") != std::string::npos)
-        return errorPage(srv, NULL, 403, "Forbidden");
+        resp = errorPage(srv, NULL, 403, "Forbidden");
+    else
+    {
+        const LocationConfig *loc = matchLocation(srv, req.path);
+        if (loc == NULL)
+            resp = errorPage(srv, NULL, 404, "Not Found");
+        else if (loc->has_redirect)
+            resp = redirectResponse(loc->redirect_code, loc->redirect_target);
+        // HEAD is checked as its own method: on a GET-only location it's a 405,
+        // matching the tester's "/ answers GET only". Where HEAD *is* allowed it
+        // is served like GET (below), then the body is stripped before return.
+        else if (!methodAllowed(*loc, req.method))
+            resp = methodNotAllowedResponse(*loc);
+        else if (req.method == "GET" || isHead)
+            resp = serveGet(srv, *loc, req);
+        else if (req.method == "POST")
+            resp = serveUpload(srv, *loc, req);
+        else if (req.method == "DELETE")
+            resp = serveDelete(srv, *loc, req);
+        else
+            resp = errorPage(srv, loc, 501, "Not Implemented");
+    }
 
-    const LocationConfig *loc = matchLocation(srv, req.path);
-    if (loc == NULL)
-        return errorPage(srv, NULL, 404, "Not Found");
-
-    if (loc->has_redirect)
-        return redirectResponse(loc->redirect_code, loc->redirect_target);
-
-    if (!methodAllowed(*loc, req.method))
-        return methodNotAllowedResponse(*loc);
-
-    if (req.method == "GET")
-        return serveGet(srv, *loc, req);
-
-    if (req.method == "POST")
-        return serveUpload(srv, *loc, req);
-
-    if (req.method == "DELETE")
-        return serveDelete(srv, *loc, req);
-
-    return errorPage(srv, loc, 501, "Not Implemented");
+    // A HEAD response carries the same status/headers as GET but no body — and
+    // that must hold for error responses too, or a leftover body desyncs the
+    // client's keep-alive channel.
+    return isHead ? stripBody(resp) : resp;
 }

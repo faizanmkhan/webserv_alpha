@@ -21,10 +21,12 @@
 #include <iostream>
 #include <ctime>
 #include <cctype>
+#include <sstream>
+#include <csignal>
 
 #define CLIENT_TIMEOUT 30
 #define MAX_EVENTS 64
-#define BUF_SIZE 4096
+#define BUF_SIZE 65536   // 64KB read slab: 16x fewer syscalls than 4KB on large bodies
 
 enum ConnState { 
     READING, 
@@ -35,7 +37,14 @@ struct ClientConnection
 {
     size_t      serverIndex;
     std::string buffer;       // inbound: request bytes accumulated across reads
-    std::string writeBuffer;  // outbound: response bytes not yet sent
+    std::string writeBuffer;  // outbound: the full response being sent
+    size_t      writeOff;     // how much of writeBuffer is already sent
+                              // (an offset, NOT erase(0,s): erasing the front of a
+                              // 100MB response memmoves the tail on every send = O(n^2))
+
+    // Resumable chunked-decode state (0 = decoder not started for this request).
+    size_t      chunkPos;     // where the decoder left off inside `buffer`
+    std::string chunkBody;    // decoded body accumulated so far
     bool        keepAlive;    // may we reuse this socket for another request?
     size_t      consumed;     // bytes the current request occupies in buffer
     time_t      lastActive;   // last time we read or wrote real bytes
@@ -48,11 +57,12 @@ struct ClientConnection
     size_t      cgiInOff;       // how much of cgiInBuf we've already written
     std::string cgiOutBuf;      // script output accumulated so far
     time_t      cgiStart;       // fork timestamp, for the 504 timeout
+    bool        cgiScriptMissing; // script file absent at launch: empty output -> 404 not 502
 
     ClientConnection()
-        : serverIndex(0),keepAlive(false), consumed(0), lastActive(0), 
+        : serverIndex(0), writeOff(0), chunkPos(0), keepAlive(false), consumed(0), lastActive(0),
           state(READING), cgiPid(-1), cgiInFd(-1), cgiOutFd(-1), cgiInOff(0),
-          cgiStart(0) {}
+          cgiStart(0), cgiScriptMissing(false) {}
 };
 
 void runEventLoop(const std::vector<ServerConfig> &servers);

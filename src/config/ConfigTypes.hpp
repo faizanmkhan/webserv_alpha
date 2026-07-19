@@ -17,8 +17,11 @@ struct LocationConfig
     bool                                has_redirect;
     int                                 redirect_code;    // e.g. 301
     std::string                        redirect_target;
+    bool                                has_max_body;     // set -> override server's cap
+    size_t                              client_max_body_size;
 
-    LocationConfig() : autoindex(false), has_redirect(false), redirect_code(0) {}
+    LocationConfig() : autoindex(false), has_redirect(false), redirect_code(0),
+                       has_max_body(false), client_max_body_size(0) {}
 };
 
 struct ServerConfig

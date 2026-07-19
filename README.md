@@ -203,6 +203,45 @@ timeout 20 siege -b -c 50 -t 10S http://127.0.0.1:8080/   # ~100% availability, 
 valgrind --leak-check=full --track-fds=yes ./webserv config/default.conf
 ```
 
+## Passing the official 42 tester (`cgi_tester`)
+
+The subject ships a compiled tester (`./tester`) that drives the server with a
+long sequence of requests, including a provided CGI binary (`cgi_tester`) that
+answers `.bla` requests. `config/tester.conf` and the `YoupiBanane/` fixture
+set up exactly what it asks for. The tester is a **client** — start the server
+first, then run it against a running instance:
+
+```
+./webserv config/tester.conf     # terminal 1 (leave running)
+./tester http://localhost:8080   # terminal 2
+```
+
+Config layout (mirrors the tester's stated requirements):
+
+- `/` — `GET` only (other methods → `405`)
+- `/directory` — `GET`; `root` is `YoupiBanane`, index `youpi.bad_extension`
+- `.bla` under `/directory` — `POST` runs the `cgi_tester` executable
+- `/post_body` — `POST` with a **per-location** `client_max_body_size` of `100`
+
+### What the tester exposed, and how it was fixed
+
+Running the real tester surfaced bugs the hand-written tests had missed — most
+notably **two `O(n²)` bugs that only a large, streaming, concurrent client
+triggers**. Each was found by reproducing the exact request the tester sends.
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `.bla` POST → `500 PATH_INFO incorrect` (from cgi_tester itself) | CGI env was missing **`REQUEST_URI`**, which cgi_tester cross-checks against `SCRIPT_NAME`/`PATH_INFO` | Set `REQUEST_URI` (path + query) in `buildCgiEnv` |
+| HEAD → framing error, then `bad status code` | A response to a HEAD request was carrying a **body**, desyncing the keep-alive channel | HEAD served like GET but run through `stripBody()`; a body-less response on **every** HEAD path (incl. errors) |
+| `GET /directory/Yeah` (dir, no index) got a listing, wanted `404` | Directory with no servable index returned a listing / `403` | `autoindex off` + no-index directory now returns `404` |
+| 100 MB POST to `.bla` → `413`, then a hang | `client_max_body_size` was **server-wide**, so it capped the CGI upload | **Per-location `client_max_body_size`**; `/post_body` caps at 100, `/directory` inherits a generous default |
+| 100 MB chunked POST → ~92 % CPU, never finishes | Chunked decoder re-parsed the **whole** body from byte 0 on every `recv` (`O(n²)`) | **Resumable** decoder: per-connection offset + accumulator, each byte parsed once |
+| `POST` to a **missing** `.bla` file → `404`, wanted `200` | Server refused the CGI launch on a missing script file | Launch anyway; answer `404` only if the CGI itself produces no output |
+| 20 concurrent 100 MB CGI posts → a non-`200` | `EPOLLOUT` did `writeBuffer.erase(0, s)` — erasing the front of a 100 MB response `memmove`s the tail on every send (`O(n²)`); and `CGI_TIMEOUT` was 5 s | Send via a `writeOff` **offset** (no front-erase); `CGI_TIMEOUT` → 30 s; 64 KB read buffer; buffers moved by `swap`, freed when consumed |
+
+Result: twenty concurrent 100 MB chunked CGI posts return twenty `200`s in
+~10 s with the server staying responsive, and `./tester` runs to completion.
+
 ## HTTP status codes
 
 Codes the server returns, and when. ✅ = implemented, ⏳ = planned in a
@@ -217,8 +256,8 @@ later phase.
 | ✅ `302 Found` | Temporary redirect | A location configured with `return 302 <target>`. |
 | ✅ `400 Bad Request` | Malformed request | Unparseable request line/headers, a non-numeric `Content-Length`, an upload with no filename in the path, or a malformed chunked body (bad chunk size). |
 | ✅ `411 Length Required` | Missing length | A POST with neither `Content-Length` nor `Transfer-Encoding: chunked` — the body has no delimiter. |
-| ✅ `403 Forbidden` | Access denied | Path traversal (`..`), a directory with no index and autoindex off, uploads to a route without `upload_store`, or an unreadable file. |
-| ✅ `404 Not Found` | No such resource | The requested path does not exist, or no location matches it. |
+| ✅ `403 Forbidden` | Access denied | Path traversal (`..`), uploads to a route without `upload_store`, or an unreadable file. |
+| ✅ `404 Not Found` | No such resource | The requested path does not exist, no location matches it, or a directory has no servable index and autoindex is off. |
 | ✅ `405 Method Not Allowed` | Method not permitted | The method is not in the location's allowed `methods`; includes an `Allow:` header listing what is permitted. |
 | ✅ `413 Payload Too Large` | Body too big | The request body exceeds `client_max_body_size`; rejected before the body is buffered. |
 | ✅ `414 URI Too Long` | Request target too long | The request line exceeds the configured limit (8 KB), bounding memory instead of buffering it. |

@@ -1,12 +1,9 @@
 #include "EventLoop.hpp"
 #include "../http/CgiHandler.hpp"
-#include <sstream>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <ctime>
-#include <csignal>
 
-#define CGI_TIMEOUT 5       // seconds a CGI child may run before we kill it -> 504
+
+#define CGI_TIMEOUT 30      // seconds a CGI child may run before we kill it -> 504
+                            // (generous: 20 concurrent 100MB CGI jobs share one loop)
 #define MAX_HEADER_SIZE 16384  // cap header-block buffering; overflow -> 431
 
 // Reason phrase for the status codes we raise straight from the event loop.
@@ -22,6 +19,26 @@ static std::string reasonPhrase(int code)
         default:  return "Error";
     }
 }
+
+
+static void logMsg(const std::string &msg)
+{
+    std::cerr << "[webserv] " << msg << "\n";   // "\n" not std::endl: avoids a
+}                                                // flush on every request under load
+
+static void logStatus(const std::string &resp)
+{
+    size_t eol = resp.find("\r\n");
+    logMsg("  -> " + (eol == std::string::npos ? resp : resp.substr(0, eol)));
+}
+
+static std::string toStr(long n)         // C++98 has no std::to_string
+{
+    std::ostringstream oss;
+    oss << n;
+    return oss.str();
+}
+
 
 // Flip a client fd from "I want to read" to "I want to write". We call this
 // once a full response has been built into writeBuffer, so the next time the
@@ -79,6 +96,8 @@ static void handleCgiEvent(int epfd, int fd, unsigned int revents,
             close(fd);                 // EOF to the child: "body is complete"
             pipeOwner.erase(fd);
             c.cgiInFd = -1;
+            std::string().swap(c.cgiInBuf);   // body delivered: free it (may be 100MB)
+            c.cgiInOff = 0;
         }
         return;
     }
@@ -112,8 +131,13 @@ static void handleCgiEvent(int epfd, int fd, unsigned int revents,
         waitpid(c.cgiPid, &status, 0);  // EOF means it has closed stdout → about to exit
         c.cgiPid = -1;
 
-        c.writeBuffer = buildCgiResponse(c.cgiOutBuf);
+        if (c.cgiOutBuf.empty() && c.cgiScriptMissing)
+            c.writeBuffer = errorResponse(404, "Not Found");   // script absent, child said nothing
+        else
+            c.writeBuffer = buildCgiResponse(c.cgiOutBuf);
+        std::string().swap(c.cgiOutBuf);      // folded into writeBuffer: free the copy
         c.state = WRITING;
+        logStatus(c.writeBuffer);
         flipToWrite(epfd, clientFd);    // hand off to your existing send path
     }
 }
@@ -175,6 +199,7 @@ static void reapIdleClients(int epfd, std::map<int, ClientConnection> &clients)
         }
         int fd = it->first;
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        logMsg("close   fd=" + toStr(fd));
         close(fd);
         clients.erase(it++);   // erase-while-iterating: post-increment first
     }
@@ -219,6 +244,7 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
     {
         int fd = createListeningSocket(servers[i].host, servers[i].port);
         listenFdToServer[fd] = i;
+        logMsg("listening on " + servers[i].host + ":" + toStr(servers[i].port));
     }
 
     int epfd = epoll_create(1);
@@ -277,6 +303,7 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         continue;
                     }
                     clients[clientFd].serverIndex = lit->second;
+                    logMsg("accept  fd=" + toStr(clientFd));
                     clients[clientFd].lastActive = time(NULL);
                 }
                 else if (pipeOwner.find(fd) != pipeOwner.end())
@@ -314,6 +341,8 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                             {
                                 cit->second.writeBuffer =
                                     errorResponse(431, reasonPhrase(431));
+                                logStatus(cit->second.writeBuffer);
+                                logStatus(cit->second.writeBuffer);
                                 flipToWrite(epfd, fd);
                             }
                             continue;   // headers incomplete, wait for next EPOLLIN
@@ -327,14 +356,22 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         int pst = parseRequest(cit->second.buffer.substr(0, pos + 2), req);
                         if (pst != 0)
                         {
+                            logMsg(req.method + " " + req.path + " " + req.version + "  (fd=" + toStr(fd) + ")");
                             cit->second.keepAlive = reusable;
                             cit->second.writeBuffer = errorResponse(pst, reasonPhrase(pst));
+                            logStatus(cit->second.writeBuffer);
                             flipToWrite(epfd, fd);
                             continue;
                         }
 
                         // ---- Stage 2: get the full body (chunked or Content-Length) ----
                         size_t headerEnd = pos + 4;   // first byte of the body
+
+                        // Effective body cap: a matched location may override the server's.
+                        size_t maxBody = srv.client_max_body_size;
+                        const LocationConfig *bloc = matchLocation(srv, req.path);
+                        if (bloc && bloc->has_max_body)
+                            maxBody = bloc->client_max_body_size;
 
                         bool chunked = false;
                         std::map<std::string, std::string>::const_iterator te =
@@ -346,24 +383,46 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         if (chunked)
                         {
                             // Un-chunk before anyone (CGI included) sees the body.
-                            std::string decoded;
-                            ChunkStatus cs =
-                                decodeChunked(cit->second.buffer.substr(headerEnd), decoded);
+                            // The decoder is resumable: chunkPos remembers where it
+                            // stopped, so each recv only parses the NEW bytes
+                            // (re-decoding 100MB from scratch per recv is O(n^2)).
+                            if (cit->second.chunkPos == 0)
+                                cit->second.chunkPos = headerEnd;   // first pass
+                            ChunkStatus cs = decodeChunked(cit->second.buffer,
+                                                           cit->second.chunkPos,
+                                                           cit->second.chunkBody);
+                            // Reclaim raw bytes the decoder consumed: otherwise a
+                            // 100MB upload holds ~200MB per connection (raw+decoded).
+                            if (cit->second.chunkPos > headerEnd)
+                            {
+                                cit->second.buffer.erase(headerEnd,
+                                    cit->second.chunkPos - headerEnd);
+                                cit->second.chunkPos = headerEnd;
+                            }
+                            // Enforce the cap while STREAMING, not just at the end —
+                            // otherwise an over-limit chunked body buffers unbounded.
+                            if (cit->second.chunkBody.size() > maxBody)
+                            {
+                                cit->second.chunkPos = 0;
+                                cit->second.chunkBody.clear();
+                                cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
+                                logStatus(cit->second.writeBuffer);
+                                flipToWrite(epfd, fd);
+                                continue;
+                            }
                             if (cs == CHUNK_INCOMPLETE)
                                 continue;                 // wait for more bytes
                             if (cs == CHUNK_ERROR)
                             {
+                                cit->second.chunkPos = 0;
+                                cit->second.chunkBody.clear();
                                 cit->second.writeBuffer = errorResponse(400, "Bad Request");
+                                logStatus(cit->second.writeBuffer);
                                 flipToWrite(epfd, fd);
                                 continue;
                             }
-                            if (decoded.size() > srv.client_max_body_size)
-                            {
-                                cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
-                                flipToWrite(epfd, fd);
-                                continue;
-                            }
-                            req.body = decoded;
+                            req.body.swap(cit->second.chunkBody);   // hand over, no copy
+                            cit->second.chunkPos = 0;               // ready for next request
                         }
                         else
                         {
@@ -379,6 +438,7 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                                     v.find_first_not_of("0123456789") != std::string::npos)
                                 {
                                     cit->second.writeBuffer = errorResponse(400, reasonPhrase(400));
+                                    logStatus(cit->second.writeBuffer);
                                     flipToWrite(epfd, fd);
                                     continue;
                                 }
@@ -390,14 +450,16 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                                 // A body-bearing method with no length and no
                                 // chunked framing: we can't know where it ends.
                                 cit->second.writeBuffer = errorResponse(411, reasonPhrase(411));
+                                logStatus(cit->second.writeBuffer);
                                 flipToWrite(epfd, fd);
                                 continue;
                             }
 
                             // Refuse an oversized body up front, before waiting for it.
-                            if (contentLength > srv.client_max_body_size)
+                            if (contentLength > maxBody)
                             {
                                 cit->second.writeBuffer = errorResponse(413, "Payload Too Large");
+                                logStatus(cit->second.writeBuffer);
                                 flipToWrite(epfd, fd);
                                 continue;
                             }
@@ -416,17 +478,27 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         std::string interp, script;
                         if (resolveCgi(srv, req, interp, script))
                         {
+                            // A missing script does NOT refuse the launch: the CGI
+                            // owns its resources and may answer anyway (the 42
+                            // cgi_tester serves nonexistent .bla paths with 200).
+                            // We remember the fact: if the child then produces no
+                            // output at all (e.g. python failing to open the file),
+                            // we answer 404 instead of 502.
                             struct stat st;
-                            if (stat(script.c_str(), &st) == -1 || S_ISDIR(st.st_mode))
+                            bool missing = (stat(script.c_str(), &st) == -1);
+                            if (!missing && S_ISDIR(st.st_mode))
                             {
                                 cit->second.writeBuffer = errorResponse(404, "Not Found");
+                                logStatus(cit->second.writeBuffer);
                                 flipToWrite(epfd, fd);
                                 continue;
                             }
+                            cit->second.cgiScriptMissing = missing;
                             CgiProcess proc;
                             if (!startCgi(srv, req, interp, script, proc))
                             {
                                 cit->second.writeBuffer = errorResponse(500, "Internal Server Error");
+                                logStatus(cit->second.writeBuffer);
                                 flipToWrite(epfd, fd);
                                 continue;
                             }
@@ -444,7 +516,7 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                             if (!req.body.empty())
                             {
                                 cit->second.cgiInFd  = proc.inFd;
-                                cit->second.cgiInBuf = req.body;
+                                cit->second.cgiInBuf.swap(req.body);   // hand over, no 100MB copy
                                 cit->second.cgiInOff = 0;
                                 epollAdd(epfd, proc.inFd, EPOLLOUT); // feed the body
                                 pipeOwner[proc.inFd] = fd;
@@ -460,30 +532,37 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         cit->second.keepAlive   = reusable && shouldKeepAlive(req);
                         cit->second.writeBuffer = handleRequest(srv, req);
                         applyKeepAlive(cit->second.writeBuffer, cit->second.keepAlive);
+                        logStatus(cit->second.writeBuffer);
                         flipToWrite(epfd, fd);
                     }
                     else if (events[i].events & EPOLLOUT)
                     {
-                        // Client socket is writable: send as much as it will take.
+                        // Client socket is writable: send from the current offset.
+                        // writeOff advances instead of erase(0,s): erasing the front
+                        // of a 100MB response memmoves the tail every send = O(n^2).
                         std::string &out = cit->second.writeBuffer;
-                        int s = send(fd, out.c_str(), out.size(), 0);
+                        int s = send(fd, out.c_str() + cit->second.writeOff,
+                                         out.size() - cit->second.writeOff, 0);
                         if (s > 0)
                         {
-                            out.erase(0, s);
+                            cit->second.writeOff += static_cast<size_t>(s);
                             cit->second.lastActive = time(NULL);
                         }
                         if (s <= 0)
                         {
                             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                            logMsg("close   fd=" + toStr(fd));
                             close(fd);
                             clients.erase(cit);
                         }
-                        else if (out.empty())
+                        else if (cit->second.writeOff >= out.size())
                         {
                             if (cit->second.keepAlive)
                             {
                                 // Reuse: drop the consumed request, wait for the next one.
                                 cit->second.buffer.erase(0, cit->second.consumed);
+                                std::string().swap(cit->second.writeBuffer);  // free, not just clear
+                                cit->second.writeOff  = 0;
                                 cit->second.consumed  = 0;
                                 cit->second.keepAlive = false;
                                 cit->second.state     = READING;
@@ -492,6 +571,7 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                             else
                             {
                                 epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                                logMsg("close   fd=" + toStr(fd));
                                 close(fd);
                                 clients.erase(cit);
                             }

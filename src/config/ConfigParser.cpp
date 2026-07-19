@@ -205,6 +205,22 @@ void ConfigParser::parseLocationDirective(LocationConfig &loc)
         loc.has_redirect = true;
         expect(TOKEN_SEMICOLON, "return");
     }
+    else if (checkWord("client_max_body_size"))
+    {
+        advance();
+        if (atEnd() || current().type != TOKEN_WORD)
+            throw std::runtime_error("expected a size after 'client_max_body_size'");
+        std::string value = advance().value;
+        char unit = value[value.size() - 1];
+        size_t multiplier = 1;
+        if (unit == 'K' || unit == 'k') multiplier = 1024;
+        else if (unit == 'M' || unit == 'm') multiplier = 1024 * 1024;
+        else if (unit == 'G' || unit == 'g') multiplier = 1024 * 1024 * 1024;
+        std::string numberPart = (multiplier > 1) ? value.substr(0, value.size() - 1) : value;
+        loc.client_max_body_size = std::atol(numberPart.c_str()) * multiplier;
+        loc.has_max_body = true;
+        expect(TOKEN_SEMICOLON, "client_max_body_size");
+    }
     else
         throw std::runtime_error("unknown directive: " + current().value);
 }

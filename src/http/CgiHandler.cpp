@@ -21,6 +21,13 @@ static std::vector<std::string> buildCgiEnv(const ServerConfig &srv,
     env.push_back("SCRIPT_NAME=" + req.path);
     env.push_back("SCRIPT_FILENAME=" + scriptPath);
     env.push_back("PATH_INFO=" + req.path);
+    // REQUEST_URI is the original request target (path + query). The 42
+    // cgi_tester cross-checks it against SCRIPT_NAME/PATH_INFO and rejects the
+    // request ("PATH_INFO incorrect") if it's missing.
+    std::string requestUri = req.path;
+    if (!req.query.empty())
+        requestUri += "?" + req.query;
+    env.push_back("REQUEST_URI=" + requestUri);
     env.push_back("QUERY_STRING=" + req.query);
     env.push_back("SERVER_NAME=" + srv.host);
     env.push_back("REMOTE_ADDR=127.0.0.1");   // we accept() with NULL addr
