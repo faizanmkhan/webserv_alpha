@@ -16,7 +16,13 @@ and `multipart/form-data`) from a real browser, un-chunks
 `Transfer-Encoding: chunked` request bodies, and runs **CGI** scripts
 (Python/PHP-CGI) — forked children whose stdin/stdout pipes are driven by
 the same epoll loop, with a timeout that guarantees no request hangs
-forever.
+forever. Connections are **persistent** (HTTP/1.1 keep-alive, honouring
+`Connection: close` and HTTP/1.0 defaults), **idle connections are reaped**
+after a timeout, `SIGPIPE` is ignored so a client vanishing mid-`send()`
+can't kill the server, and any per-connection exception (including
+out-of-memory) is contained to that one connection rather than crashing the
+process. Multiple `server` blocks on **different ports serve different
+content** through the single epoll loop.
 
 ## Instructions
 
@@ -130,6 +136,50 @@ script that produces no output returns `502 Bad Gateway`:
 
 ```
 curl -v http://127.0.0.1:8080/cgi-bin/nope.py    # 404
+```
+
+### Keep-alive & connection handling
+
+HTTP/1.1 connections are persistent: after a response the parser resets and
+the next request is served on the **same** socket. `curl` reuses the
+connection for two requests (`Re-using existing connection`), and an
+explicit `Connection: close` is honoured:
+
+```
+curl -v http://127.0.0.1:8080/ http://127.0.0.1:8080/           # Re-using existing connection
+curl -v -H "Connection: close" http://127.0.0.1:8080/           # Closing connection
+curl -v --http1.0 http://127.0.0.1:8080/                        # served, then closed (HTTP/1.0 default)
+```
+
+Idle connections are reaped after a timeout, so an abandoned or slow client
+cannot hold an fd forever (slow-loris defence). Open a raw socket and walk
+away — it disappears on its own, while normal requests keep working:
+
+```
+( exec 3<>/dev/tcp/127.0.0.1/8080; sleep 40 ) &   # idle socket is closed after CLIENT_TIMEOUT
+```
+
+### Multiple servers on different ports
+
+Two `server` blocks on different ports serve different content through the
+single epoll loop:
+
+```
+./webserv config/two_sites.conf
+curl -s http://127.0.0.1:8080/    # content from ./www
+curl -s http://127.0.0.1:8081/    # content from ./www2
+```
+
+### Robustness
+
+`SIGPIPE` is ignored, and any exception on one connection (including
+out-of-memory) is contained to that connection instead of terminating the
+server. A burst of concurrent and malformed requests leaves it responsive:
+
+```
+for i in $(seq 1 200); do curl -s -o /dev/null http://127.0.0.1:8080/ & done; wait
+printf 'GARBAGE \r\n\r\n' | nc -q1 127.0.0.1 8080
+curl -s http://127.0.0.1:8080/    # still serving
 ```
 
 ## HTTP status codes
