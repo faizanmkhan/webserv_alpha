@@ -20,7 +20,9 @@
 #include <stdexcept>
 #include <iostream>
 #include <ctime>
+#include <cctype>
 
+#define CLIENT_TIMEOUT 30
 #define MAX_EVENTS 64
 #define BUF_SIZE 4096
 
@@ -34,7 +36,9 @@ struct ClientConnection
     size_t      serverIndex;
     std::string buffer;       // inbound: request bytes accumulated across reads
     std::string writeBuffer;  // outbound: response bytes not yet sent
-
+    bool        keepAlive;    // may we reuse this socket for another request?
+    size_t      consumed;     // bytes the current request occupies in buffer
+    time_t      lastActive;   // last time we read or wrote real bytes
     // --- CGI job state (only meaningful while state == CGI_RUNNING) ---
     ConnState   state;          // where this connection is in its lifecycle
     pid_t       cgiPid;         // child process id (-1 = none)
@@ -46,8 +50,9 @@ struct ClientConnection
     time_t      cgiStart;       // fork timestamp, for the 504 timeout
 
     ClientConnection()
-        : serverIndex(0), state(READING), cgiPid(-1),
-          cgiInFd(-1), cgiOutFd(-1), cgiInOff(0), cgiStart(0) {}
+        : serverIndex(0),keepAlive(false), consumed(0), lastActive(0), 
+          state(READING), cgiPid(-1), cgiInFd(-1), cgiOutFd(-1), cgiInOff(0),
+          cgiStart(0) {}
 };
 
 void runEventLoop(const std::vector<ServerConfig> &servers);
