@@ -14,7 +14,10 @@ struct HttpRequest
     std::string                        body;      // raw request body bytes
 };
 
-bool parseRequest(const std::string &raw, HttpRequest &out);
+// Parse the request line + header block. Returns 0 on success, or an HTTP
+// error code to answer with: 400 (malformed), 414 (request line too long),
+// 505 (unsupported HTTP version).
+int parseRequest(const std::string &raw, HttpRequest &out);
 
 // Decode a Transfer-Encoding: chunked body. `raw` is the bytes after the header
 // block. On CHUNK_DONE `out` holds the un-chunked body. CHUNK_INCOMPLETE means

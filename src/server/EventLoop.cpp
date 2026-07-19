@@ -6,7 +6,22 @@
 #include <ctime>
 #include <csignal>
 
-#define CGI_TIMEOUT 5   // seconds a CGI child may run before we kill it -> 504
+#define CGI_TIMEOUT 5       // seconds a CGI child may run before we kill it -> 504
+#define MAX_HEADER_SIZE 16384  // cap header-block buffering; overflow -> 431
+
+// Reason phrase for the status codes we raise straight from the event loop.
+static std::string reasonPhrase(int code)
+{
+    switch (code)
+    {
+        case 400: return "Bad Request";
+        case 411: return "Length Required";
+        case 414: return "URI Too Long";
+        case 431: return "Request Header Fields Too Large";
+        case 505: return "HTTP Version Not Supported";
+        default:  return "Error";
+    }
+}
 
 // Flip a client fd from "I want to read" to "I want to write". We call this
 // once a full response has been built into writeBuffer, so the next time the
@@ -291,17 +306,29 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                         // ---- Stage 1: do we have the whole header block yet? ----
                         size_t pos = cit->second.buffer.find("\r\n\r\n");
                         if (pos == std::string::npos)
+                        {
+                            // No end-of-headers yet. Bound the buffer so a client
+                            // can't force unbounded memory growth by never sending
+                            // the blank line (or by sending a huge header block).
+                            if (cit->second.buffer.size() > MAX_HEADER_SIZE)
+                            {
+                                cit->second.writeBuffer =
+                                    errorResponse(431, reasonPhrase(431));
+                                flipToWrite(epfd, fd);
+                            }
                             continue;   // headers incomplete, wait for next EPOLLIN
+                        }
 
                         const ServerConfig &srv = servers[cit->second.serverIndex];
 
                         // Parse the header block so we can read Content-Length.
                         HttpRequest req;
                         bool reusable = false;   // true only once we hold a cleanly delimited request
-                        if (!parseRequest(cit->second.buffer.substr(0, pos + 2), req))
+                        int pst = parseRequest(cit->second.buffer.substr(0, pos + 2), req);
+                        if (pst != 0)
                         {
                             cit->second.keepAlive = reusable;
-                            cit->second.writeBuffer = errorResponse(400, "Bad Request");
+                            cit->second.writeBuffer = errorResponse(pst, reasonPhrase(pst));
                             flipToWrite(epfd, fd);
                             continue;
                         }
@@ -345,8 +372,26 @@ void runEventLoop(const std::vector<ServerConfig> &servers)
                                 req.headers.find("content-length");
                             if (cl != req.headers.end())
                             {
-                                std::istringstream iss(cl->second);
-                                iss >> contentLength;     // TODO: reject non-numeric with 400
+                                // Content-Length must be a plain non-empty run of
+                                // digits — anything else is a malformed framing.
+                                const std::string &v = cl->second;
+                                if (v.empty() ||
+                                    v.find_first_not_of("0123456789") != std::string::npos)
+                                {
+                                    cit->second.writeBuffer = errorResponse(400, reasonPhrase(400));
+                                    flipToWrite(epfd, fd);
+                                    continue;
+                                }
+                                std::istringstream iss(v);
+                                iss >> contentLength;
+                            }
+                            else if (req.method == "POST")
+                            {
+                                // A body-bearing method with no length and no
+                                // chunked framing: we can't know where it ends.
+                                cit->second.writeBuffer = errorResponse(411, reasonPhrase(411));
+                                flipToWrite(epfd, fd);
+                                continue;
                             }
 
                             // Refuse an oversized body up front, before waiting for it.

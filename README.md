@@ -182,6 +182,27 @@ printf 'GARBAGE \r\n\r\n' | nc -q1 127.0.0.1 8080
 curl -s http://127.0.0.1:8080/    # still serving
 ```
 
+### Automated test suite
+
+`tests/torture.py` is a multithreaded conformance + stress harness (standard
+library only). It runs many threads firing a mix of well-formed and
+deliberately malformed requests (GET/POST/DELETE/CGI, keep-alive reuse, bad
+version, non-numeric `Content-Length`, missing length, giant URI, raw
+garbage) and asserts the status code for each, then confirms the server is
+still alive:
+
+```
+./webserv config/default.conf                 # terminal 1
+python3 tests/torture.py 127.0.0.1 8080 10 50 # host port seconds threads
+```
+
+For raw stress and leak/fd checking:
+
+```
+timeout 20 siege -b -c 50 -t 10S http://127.0.0.1:8080/   # ~100% availability, 0 failed
+valgrind --leak-check=full --track-fds=yes ./webserv config/default.conf
+```
+
 ## HTTP status codes
 
 Codes the server returns, and when. ✅ = implemented, ⏳ = planned in a
@@ -194,19 +215,19 @@ later phase.
 | ✅ `204 No Content` | Success, empty body | A successful DELETE; the response carries no body. |
 | ✅ `301 Moved Permanently` | Permanent redirect | A location configured with `return 301 <target>`; sends a `Location:` header. |
 | ✅ `302 Found` | Temporary redirect | A location configured with `return 302 <target>`. |
-| ✅ `400 Bad Request` | Malformed request | Unparseable request line/headers, an upload with no filename in the path, or a malformed chunked body (bad chunk size). |
-| ⏳ `411 Length Required` | Missing length | A POST with neither `Content-Length` nor chunked encoding (Phase 9). |
+| ✅ `400 Bad Request` | Malformed request | Unparseable request line/headers, a non-numeric `Content-Length`, an upload with no filename in the path, or a malformed chunked body (bad chunk size). |
+| ✅ `411 Length Required` | Missing length | A POST with neither `Content-Length` nor `Transfer-Encoding: chunked` — the body has no delimiter. |
 | ✅ `403 Forbidden` | Access denied | Path traversal (`..`), a directory with no index and autoindex off, uploads to a route without `upload_store`, or an unreadable file. |
 | ✅ `404 Not Found` | No such resource | The requested path does not exist, or no location matches it. |
 | ✅ `405 Method Not Allowed` | Method not permitted | The method is not in the location's allowed `methods`; includes an `Allow:` header listing what is permitted. |
 | ✅ `413 Payload Too Large` | Body too big | The request body exceeds `client_max_body_size`; rejected before the body is buffered. |
-| ⏳ `414 URI Too Long` | Request target too long | The request line exceeds the configured limit (Phase 11 hardening). |
-| ⏳ `431 Request Header Fields Too Large` | Headers too big | The header block exceeds the configured limit (Phase 11 hardening). |
+| ✅ `414 URI Too Long` | Request target too long | The request line exceeds the configured limit (8 KB), bounding memory instead of buffering it. |
+| ✅ `431 Request Header Fields Too Large` | Headers too big | The header block passes the cap (16 KB) with no end-of-headers — a client can't force unbounded buffering. |
 | ✅ `500 Internal Server Error` | Server-side failure | An upload's file write failed, or a CGI child could not be started (`pipe`/`fork` failed). |
 | ✅ `501 Not Implemented` | Unsupported method | A method the server does not implement (e.g. PUT/HEAD). |
 | ✅ `502 Bad Gateway` | Bad upstream response | A CGI script produced no output at all (e.g. the interpreter/script failed to run). |
 | ✅ `504 Gateway Timeout` | Upstream too slow | A CGI child ran past the configured timeout; the server `kill()`s it and answers 504, while other clients keep being served. |
-| ⏳ `505 HTTP Version Not Supported` | Bad HTTP version | A request whose version is not `HTTP/1.1` (Phase 11 hardening). |
+| ✅ `505 HTTP Version Not Supported` | Bad HTTP version | A request whose version is neither `HTTP/1.1` nor `HTTP/1.0`. |
 
 Every 4xx/5xx is served either from a configured `error_page` file or a
 generated HTML fallback, so an error response is never empty.

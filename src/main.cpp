@@ -49,6 +49,7 @@ int main(int argc, char **argv)
     std::stringstream buffer;
     buffer << file.rdbuf();
     std::string content = buffer.str();
+    file.close();   // done reading; don't hold the config fd for the server's life
 
     std::vector<Token> tokens = tokenize(content);
 

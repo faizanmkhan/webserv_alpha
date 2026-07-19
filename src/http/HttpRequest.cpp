@@ -31,28 +31,37 @@ static std::string percentDecode(const std::string &s)
     return out;
 }
 
-bool parseRequest(const std::string &raw, HttpRequest &out)
+// Cap the request line so a client can't force unbounded buffering with one
+// enormous URI (answered 414 rather than growing memory without limit).
+#define MAX_REQUEST_LINE 8192
+
+int parseRequest(const std::string &raw, HttpRequest &out)
 {
     // request line: "GET /path HTTP/1.1\r\n"
     size_t lineEnd = raw.find("\r\n");
     if (lineEnd == std::string::npos)
-        return false;
+        return 400;
     std::string line = raw.substr(0, lineEnd);
+    if (line.size() > MAX_REQUEST_LINE)
+        return 414;
 
     size_t sp1 = line.find(' ');
     if (sp1 == std::string::npos)
-        return false;
+        return 400;
     size_t sp2 = line.find(' ', sp1 + 1);
     if (sp2 == std::string::npos)
-        return false;
+        return 400;
     if (line.find(' ', sp2 + 1) != std::string::npos)
-        return false;
+        return 400;
 
     out.method  = line.substr(0, sp1);
     out.version = line.substr(sp2 + 1);
     std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1);
     if (out.method.empty() || target.empty() || out.version.empty())
-        return false;
+        return 400;
+    // We speak HTTP/1.1; accept 1.0 too, reject anything else.
+    if (out.version != "HTTP/1.1" && out.version != "HTTP/1.0")
+        return 505;
 
     // Split "path?query", then percent-decode ONLY the path. Decoding here,
     // before routing and the traversal check, is deliberate: we always
@@ -65,18 +74,18 @@ bool parseRequest(const std::string &raw, HttpRequest &out)
     }
     out.path = percentDecode(target);
     if (out.path.empty())
-        return false;
+        return 400;
 
     size_t pos = lineEnd + 2;
     while (pos < raw.size())
     {
         size_t end = raw.find("\r\n", pos);
         if (end == std::string::npos)
-            return false;                   
+            return 400;
         std::string hline = raw.substr(pos, end - pos);
         size_t colon = hline.find(':');
         if (colon == std::string::npos)
-            return false;                 
+            return 400;
         std::string name  = hline.substr(0, colon);
         std::string value = hline.substr(colon + 1);
         for (size_t i = 0; i < name.size(); ++i)
@@ -92,7 +101,7 @@ bool parseRequest(const std::string &raw, HttpRequest &out)
         out.headers[name] = value;
         pos = end + 2;
     }
-    return true;
+    return 0;
 }
 
 // Parse a chunk-size line (hexadecimal, possibly with a ";ext"). Returns false
